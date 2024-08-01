@@ -5,3 +5,5 @@
 ## Usage
 
 ```python3 mlbpitch.py```# Ump-Pitch
+
+![plot](./jul30gamesexample.png)
