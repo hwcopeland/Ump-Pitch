@@ -6,6 +6,6 @@ Adam asked me if it could be done. Turns out it can be.
 
 ## Usage
 
-```python3 mlbpitch.py```# Ump-Pitch
+```python3 mlbpitch.py```
 
 ![plot](./jul30gamesexample.png)
