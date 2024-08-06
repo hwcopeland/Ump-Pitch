@@ -15,6 +15,8 @@ from dash.dependencies import Input, Output
 import threading
 import time
 import logging
+from flask import Flask, jsonify
+from flask_cors import CORS
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,13 +30,6 @@ def load_config():
     return {}
 
 config = load_config()
-
-# Command-line argument parser
-parser = argparse.ArgumentParser(description="MLB Pitch Tracker")
-parser.add_argument("--date", help="Date to fetch games (MM/DD/YYYY)")
-parser.add_argument("--team", help="Team name to filter games")
-parser.add_argument("--output", help="Output directory for saved plots")
-args = parser.parse_args()
 
 # Global variables
 baseball_diameter = 0.075  # Approximate diameter of a baseball in meters
@@ -62,7 +57,6 @@ def get_play_data(game_id):
         home_team = game_data['gameData']['teams']['home']['teamName']
         away_team = game_data['gameData']['teams']['away']['teamName']
         
-        # Handle cases where pitcher information might not be available
         home_pitcher = "TBD"
         away_pitcher = "TBD"
         if game_data['liveData']['boxscore']['teams']['home'].get('pitchers'):
@@ -78,26 +72,31 @@ def get_play_data(game_id):
         return None
 
     # List to store pitch data
-    pitches = []
+    home_pitches = []
+    away_pitches = []
     for play in plays['allPlays']:
         for event in play['playEvents']:
             if event['isPitch']:
                 if 'pitchData' in event and 'coordinates' in event['pitchData']:
                     coords = event['pitchData']['coordinates']
                     if 'pX' in coords and 'pZ' in coords:
-                        # Extract pitch details
                         pitch_type = event['details']['type']['description'] if 'type' in event['details'] and 'description' in event['details']['type'] else 'Unknown'
                         umpire_call = event['details']['call']['description'] if 'call' in event['details'] and 'description' in event['details']['call'] else 'Unknown'
                         sz_top = event['pitchData'].get('strikeZoneTop', None)
                         sz_bottom = event['pitchData'].get('strikeZoneBottom', None)
-                        pitches.append((coords['pX'], coords['pZ'], pitch_type, umpire_call, sz_top, sz_bottom))
+                        pitcher_team = play['about']['halfInning']
+                        pitch_data = (coords['pX'], coords['pZ'], pitch_type, umpire_call, sz_top, sz_bottom)
+                        if pitcher_team == 'top':
+                            home_pitches.append(pitch_data)
+                        else:
+                            away_pitches.append(pitch_data)
 
-    if not pitches:
+    if not home_pitches and not away_pitches:
         logging.warning("No pitch data available.")
         return None
     
-    logging.info(f"Retrieved {len(pitches)} pitches.")
-    return pitches, home_team, away_team, home_pitcher, away_pitcher, umpire
+    logging.info(f"Retrieved {len(home_pitches)} home pitches and {len(away_pitches)} away pitches.")
+    return home_pitches, away_pitches, home_team, away_team, home_pitcher, away_pitcher, umpire
 
 def add_pitch_trace(fig, pitches, name, color):
     if pitches:
@@ -107,7 +106,7 @@ def add_pitch_trace(fig, pitches, name, color):
             mode='markers',
             name=name,
             text=text,
-            marker=dict(size=baseball_diameter * 100, color=color, opacity=0.5)
+            marker=dict(size=baseball_diameter * 100, color=color, opacity=0.7)
         ))
 
 def add_strike_zone(fig, pitch_data):
@@ -123,7 +122,7 @@ def add_strike_zone(fig, pitch_data):
             y=[sz_bottom, sz_bottom, sz_top, sz_top, sz_bottom],
             mode='lines',
             name='Strike Zone',
-            line=dict(color='White', width=2)
+            line=dict(color='#e0e0e0', width=2)
         ))
 
 def add_umpire_strike_zone(fig, called_strikes, balls):
@@ -132,19 +131,25 @@ def add_umpire_strike_zone(fig, called_strikes, balls):
         if len(strike_coords) >= 3:
             hull = ConvexHull(strike_coords)
             hull_points = strike_coords[hull.vertices]
-            hull_points = np.append(hull_points, [hull_points[0]], axis=0)
-            hull_polygon = Polygon(hull_points)
+            # Smooth the edges by adding more points
+            smooth_points = []
+            for i in range(len(hull_points)):
+                p1 = hull_points[i]
+                p2 = hull_points[(i + 1) % len(hull_points)]
+                smooth_points.extend(np.linspace(p1, p2, num=10))
+            smooth_points = np.array(smooth_points)
 
             fig.add_trace(go.Scatter(
-                x=hull_points[:, 0],
-                y=hull_points[:, 1],
+                x=smooth_points[:, 0],
+                y=smooth_points[:, 1],
                 fill='toself',
                 fillcolor='rgba(255, 0, 0, 0.2)',
                 mode='lines',
                 name='Umpire Strike Zone',
-                line=dict(color='red', width=2)
+                line=dict(color='red', width=2, shape='spline')
             ))
 
+            hull_polygon = Polygon(hull_points)
             add_inconsistent_calls(fig, balls, hull_polygon)
 
 def add_inconsistent_calls(fig, balls, hull_polygon):
@@ -160,7 +165,7 @@ def add_inconsistent_calls(fig, balls, hull_polygon):
     fig.add_trace(go.Scatter(
         x=inconsistent_x, y=inconsistent_y,
         mode='markers',
-        marker=dict(size=baseball_diameter * 100, color='rgba(0, 0, 255, 0.5)'),
+        marker=dict(size=baseball_diameter * 100, color='rgba(0, 0, 255, 0.7)'),
         name='Inconsistent',
         text=inconsistent_text
     ))
@@ -175,64 +180,84 @@ def add_last_pitch(fig, pitch_data):
         text=[f"{last_pitch[2]}"]
     ))
 
-def generate_plot_for_game(pitches, game_title, subtitle):
-    logging.debug(f"Generating plot with {len(pitches)} pitches")
-    if not pitches:
+def generate_plot_for_game(home_pitches, away_pitches, game_title, subtitle):
+    logging.debug(f"Generating plot with {len(home_pitches)} home pitches and {len(away_pitches)} away pitches")
+    if not home_pitches and not away_pitches:
         logging.warning("No pitch data to display.")
-        return go.Figure()  # Return an empty figure instead of None
+        return go.Figure()
 
-    pitch_data = [(float(p[0]), float(p[1]), p[2], p[3], p[4], p[5]) for p in pitches]
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("Home Team Pitches", "Away Team Pitches"))
 
-    balls = [p for p in pitch_data if p[3] == 'Ball']
-    called_strikes = [p for p in pitch_data if p[3] == 'Called Strike']
-    swinging_strikes = [p for p in pitch_data if p[3] == 'Swinging Strike']
-    fouls = [p for p in pitch_data if p[3] == 'Foul']
-    in_play = [p for p in pitch_data if p[3].startswith('In play')]
+    for idx, pitches in enumerate([home_pitches, away_pitches], start=1):
+        pitch_data = [(float(p[0]), float(p[1]), p[2], p[3], p[4], p[5]) for p in pitches]
 
-    fig = go.Figure()
+        balls = [p for p in pitch_data if p[3] == 'Ball']
+        called_strikes = [p for p in pitch_data if p[3] == 'Called Strike']
+        swinging_strikes = [p for p in pitch_data if p[3] == 'Swinging Strike']
+        fouls = [p for p in pitch_data if p[3] == 'Foul']
+        in_play = [p for p in pitch_data if p[3].startswith('In play')]
 
-    # Add traces for each pitch type
-    add_pitch_trace(fig, balls, 'Balls', 'rgba(0, 0, 255, 0.5)')
-    add_pitch_trace(fig, called_strikes, 'Called Strikes', 'rgba(255, 0, 0, 0.5)')
-    add_pitch_trace(fig, swinging_strikes, 'Swinging Strikes', 'rgba(128, 0, 128, 0.5)')
-    add_pitch_trace(fig, fouls, 'Fouls', 'rgba(255, 165, 0, 0.5)')
-    add_pitch_trace(fig, in_play, 'In Play', 'rgba(0, 128, 0, 0.5)')
+        add_pitch_trace(fig, balls, 'Balls', '#4287f5')
+        add_pitch_trace(fig, called_strikes, 'Called Strikes', '#f54242')
+        add_pitch_trace(fig, swinging_strikes, 'Swinging Strikes', '#9c42f5')
+        add_pitch_trace(fig, fouls, 'Fouls', '#f5a442')
+        add_pitch_trace(fig, in_play, 'In Play', '#42f54e')
 
-    # Add strike zone
-    add_strike_zone(fig, pitch_data)
+        add_strike_zone(fig, pitch_data)
+        add_umpire_strike_zone(fig, called_strikes, balls)
+        if pitch_data:
+            add_last_pitch(fig, pitch_data)
 
-    # Add umpire's strike zone
-    add_umpire_strike_zone(fig, called_strikes, balls)
-
-    # Add last pitch
-    add_last_pitch(fig, pitch_data)
+        fig.update_xaxes(range=[-3, 3], title="Horizontal Location (feet)", row=1, col=idx, gridcolor='#444444')
+        fig.update_yaxes(range=[0, 6], title="Vertical Location (feet)", row=1, col=idx, gridcolor='#444444')
 
     fig.update_layout(
         title=f"{game_title}<br><sub>{subtitle}</sub>",
-        xaxis=dict(range=[-3, 3], title="Horizontal Location (feet)"),
-        yaxis=dict(range=[0, 6], title="Vertical Location (feet)"),
         showlegend=True,
-        plot_bgcolor='white',
-        paper_bgcolor='white',
-        font=dict(color='black')
+        plot_bgcolor='#2b2b2b',
+        paper_bgcolor='#2b2b2b',
+        font=dict(color='#e0e0e0'),
+        margin=dict(l=50, r=50, t=80, b=50),
+        height=600
     )
 
     logging.debug("Plot generated successfully")
     return fig
 
-def generate_pitch_stats_plot(pitches):
-    pitch_types = [p[2] for p in pitches]
-    pitch_counts = {pt: pitch_types.count(pt) for pt in set(pitch_types)}
+def generate_pitch_stats_plot(home_pitches, away_pitches):
+    home_pitch_types = [p[2] for p in home_pitches]
+    away_pitch_types = [p[2] for p in away_pitches]
+    
+    home_pitch_counts = {pt: home_pitch_types.count(pt) for pt in set(home_pitch_types)}
+    away_pitch_counts = {pt: away_pitch_types.count(pt) for pt in set(away_pitch_types)}
 
-    fig = go.Figure(data=[go.Bar(x=list(pitch_counts.keys()), y=list(pitch_counts.values()))])
+    fig = make_subplots(rows=1, cols=2, subplot_titles=("Home Team Pitch Types", "Away Team Pitch Types"))
+
+    fig.add_trace(go.Bar(
+        x=list(home_pitch_counts.keys()),
+        y=list(home_pitch_counts.values()),
+        marker_color='#4287f5',
+        name='Home Team'
+    ), row=1, col=1)
+
+    fig.add_trace(go.Bar(
+        x=list(away_pitch_counts.keys()),
+        y=list(away_pitch_counts.values()),
+        marker_color='#f54242',
+        name='Away Team'
+    ), row=1, col=2)
+
     fig.update_layout(
         title="Pitch Type Distribution",
-        xaxis_title="Pitch Type",
-        yaxis_title="Count",
-        plot_bgcolor='rgba(0,0,0,0)',
-        paper_bgcolor='rgba(0,0,0,0)',
-        font=dict(color='white')
+        showlegend=True,
+        plot_bgcolor='#2b2b2b',
+        paper_bgcolor='#2b2b2b',
+        font=dict(color='#e0e0e0'),
+        margin=dict(l=50, r=50, t=80, b=50),
+        height=400
     )
+    fig.update_xaxes(title="Pitch Type", gridcolor='#444444')
+    fig.update_yaxes(title="Count", gridcolor='#444444')
     return fig
 
 def get_game_statuses(date):
@@ -245,71 +270,42 @@ def get_game_statuses(date):
         game_options.append(option)
     return game_options
 
-def main():
-    logging.info("Main function started")
-    date = args.date if args.date else datetime.now().strftime("%m/%d/%Y")
-    games = check_schedule(date)
-    
-    if args.team:
-        games = [game for game in games if args.team.lower() in game['away_name'].lower() or args.team.lower() in game['home_name'].lower()]
-    
-    if not games:
-        logging.warning(f"No games found for the specified date{' and team' if args.team else ''}.")
-        return
+def create_app():
+    app = Flask(__name__)
+    CORS(app)
 
-    logging.info("Initializing Dash app")
-    app = dash.Dash(__name__)
-    app.config.suppress_callback_exceptions = True
+    @app.route('/api/games')
+    def get_games():
+        date = datetime.now().strftime("%m/%d/%Y")
+        games = get_game_statuses(date)
+        return jsonify(games)
 
-    app.layout = html.Div([
-        dcc.Dropdown(id='game-selector', placeholder="Select a game"),
-        html.Div([
-            dcc.Graph(id='pitch-plot', style={'width': '50%', 'display': 'inline-block'}),
-            dcc.Graph(id='pitch-stats', style={'width': '50%', 'display': 'inline-block'})
-        ]),
-        html.Div(id='game-info'),
-        dcc.Interval(id='interval-component', interval=5*1000, n_intervals=0)
-    ], style={'backgroundColor': '#111111', 'color': '#FFFFFF'})
-
-    @app.callback(Output('game-selector', 'options'),
-                  Input('interval-component', 'n_intervals'))
-    def update_game_options(n):
-        date = args.date if args.date else datetime.now().strftime("%m/%d/%Y")
-        return get_game_statuses(date)
-
-    @app.callback(
-        [Output('pitch-plot', 'figure'),
-         Output('pitch-stats', 'figure'),
-         Output('game-info', 'children')],
-        [Input('game-selector', 'value'),
-         Input('interval-component', 'n_intervals')]
-    )
-    def update_graphs(selected_game_id, n):
-        if not selected_game_id:
-            return go.Figure(), go.Figure(), "No game selected"
-
-        result = get_play_data(selected_game_id)
+    @app.route('/api/game/<int:game_id>')
+    def get_game_data(game_id):
+        result = get_play_data(game_id)
         if result is None:
-            return go.Figure(), go.Figure(), "Error retrieving game data"
+            return jsonify({"error": "Error retrieving game data"}), 404
 
-        pitches, home_team, away_team, home_pitcher, away_pitcher, umpire = result
+        home_pitches, away_pitches, home_team, away_team, home_pitcher, away_pitcher, umpire = result
         game_title = f"{away_team} @ {home_team}"
-        subtitle = f"Home Pitcher: {home_pitcher}, Away Pitcher: {away_pitcher}, Umpire: {umpire}"
+        subtitle = f"Home Pitcher: {home_pitcher} ({len(home_pitches)} pitches), Away Pitcher: {away_pitcher} ({len(away_pitches)} pitches), Umpire: {umpire}"
 
-        pitch_plot = generate_plot_for_game(pitches, game_title, subtitle)
-        stats_plot = generate_pitch_stats_plot(pitches)
+        pitch_plot = generate_plot_for_game(home_pitches, away_pitches, game_title, subtitle)
+        stats_plot = generate_pitch_stats_plot(home_pitches, away_pitches)
 
-        game_info = html.Div([
-            html.H3(game_title),
-            html.P(subtitle),
-            html.P(f"Total Pitches: {len(pitches)}")
-        ])
+        return jsonify({
+            "pitch_plot": pitch_plot.to_json(),
+            "stats_plot": stats_plot.to_json(),
+            "game_info": {
+                "title": game_title,
+                "subtitle": subtitle,
+                "home_pitches": len(home_pitches),
+                "away_pitches": len(away_pitches)
+            }
+        })
 
-        return pitch_plot, stats_plot, game_info
-
-    logging.info("Starting Dash server")
-    print("Dash server running on http://127.0.0.1:8050/")
-    app.run_server(debug=True)
+    return app
 
 if __name__ == "__main__":
-    main()
+    app = create_app()
+    app.run(host='0.0.0.0', port=8686)
