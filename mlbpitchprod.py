@@ -17,6 +17,10 @@ import time
 import logging
 from flask import Flask, jsonify
 from flask_cors import CORS
+import pytz
+
+# Define local timezone, replace with your desired timezone
+local_tz = pytz.timezone('America/Chicago')
 
 # Set up logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -37,7 +41,8 @@ baseball_diameter = 0.075  # Approximate diameter of a baseball in meters
 # Function to check the game schedule for a specific date
 def check_schedule(date=None):
     if date is None:
-        date = datetime.now().strftime("%m/%d/%Y")
+        now_local = datetime.now(local_tz)
+        date = now_local.strftime("%m/%d/%Y")
     logging.info(f"Fetching schedule for: {date}")
     games = statsapi.schedule(date=date)
     return games
@@ -52,11 +57,20 @@ def get_play_data(game_id):
         logging.error(f"Error retrieving game data: {e}")
         return None
 
+    # Convert game time to local timezone
+    try:
+        game_datetime_utc = datetime.strptime(game_data['gameData']['datetime']['dateTime'], '%Y-%m-%dT%H:%M:%SZ')
+        game_datetime_local = game_datetime_utc.replace(tzinfo=pytz.utc).astimezone(local_tz)
+        game_data['gameData']['datetime']['dateTime'] = game_datetime_local.strftime('%Y-%m-%d %H:%M:%S %Z')
+    except KeyError as e:
+        logging.error(f"Error converting game time: {e}")
+        return None
+
     # Extract game details
     try:
         home_team = game_data['gameData']['teams']['home']['teamName']
         away_team = game_data['gameData']['teams']['away']['teamName']
-        
+
         home_pitcher = "TBD"
         away_pitcher = "TBD"
         if game_data['liveData']['boxscore']['teams']['home'].get('pitchers'):
@@ -65,7 +79,7 @@ def get_play_data(game_id):
         if game_data['liveData']['boxscore']['teams']['away'].get('pitchers'):
             away_pitcher_id = game_data['liveData']['boxscore']['teams']['away']['pitchers'][0]
             away_pitcher = game_data['liveData']['boxscore']['teams']['away']['players'][f'ID{away_pitcher_id}']['person']['fullName']
-        
+
         umpire = next((official['official']['fullName'] for official in game_data['liveData']['boxscore']['officials'] if official['officialType'] == 'Home Plate'), 'Unknown')
     except KeyError as e:
         logging.error(f"Error retrieving game details: {e}")
@@ -94,11 +108,11 @@ def get_play_data(game_id):
     if not home_pitches and not away_pitches:
         logging.warning("No pitch data available.")
         return None
-    
+
     logging.info(f"Retrieved {len(home_pitches)} home pitches and {len(away_pitches)} away pitches.")
     return home_pitches, away_pitches, home_team, away_team, home_pitcher, away_pitcher, umpire
 
-def add_pitch_trace(fig, pitches, name, color):
+def add_pitch_trace(fig, pitches, name, color, visible=True):
     if pitches:
         x, y, text = zip(*[(p[0], p[1], f"{p[2]}") for p in pitches])
         fig.add_trace(go.Scatter(
@@ -106,7 +120,8 @@ def add_pitch_trace(fig, pitches, name, color):
             mode='markers',
             name=name,
             text=text,
-            marker=dict(size=baseball_diameter * 100, color=color, opacity=0.7)
+            marker=dict(size=baseball_diameter * 100, color=color, opacity=0.7),
+            visible=visible
         ))
 
 def add_strike_zone(fig, pitch_data):
@@ -186,30 +201,46 @@ def generate_plot_for_game(home_pitches, away_pitches, game_title, subtitle):
         logging.warning("No pitch data to display.")
         return go.Figure()
 
-    fig = make_subplots(rows=1, cols=2, subplot_titles=("Home Team Pitches", "Away Team Pitches"))
+    fig = go.Figure()
 
-    for idx, pitches in enumerate([home_pitches, away_pitches], start=1):
-        pitch_data = [(float(p[0]), float(p[1]), p[2], p[3], p[4], p[5]) for p in pitches]
+    # Add home pitches
+    pitch_data_home = [(float(p[0]), float(p[1]), p[2], p[3], p[4], p[5]) for p in home_pitches]
+    balls_home = [p for p in pitch_data_home if p[3] == 'Ball']
+    called_strikes_home = [p for p in pitch_data_home if p[3] == 'Called Strike']
+    swinging_strikes_home = [p for p in pitch_data_home if p[3] == 'Swinging Strike']
+    fouls_home = [p for p in pitch_data_home if p[3] == 'Foul']
+    in_play_home = [p for p in pitch_data_home if p[3].startswith('In play')]
 
-        balls = [p for p in pitch_data if p[3] == 'Ball']
-        called_strikes = [p for p in pitch_data if p[3] == 'Called Strike']
-        swinging_strikes = [p for p in pitch_data if p[3] == 'Swinging Strike']
-        fouls = [p for p in pitch_data if p[3] == 'Foul']
-        in_play = [p for p in pitch_data if p[3].startswith('In play')]
+    add_pitch_trace(fig, balls_home, 'Balls (Home)', '#4287f5')
+    add_pitch_trace(fig, called_strikes_home, 'Called Strikes (Home)', '#f54242')
+    add_pitch_trace(fig, swinging_strikes_home, 'Swinging Strikes (Home)', '#9c42f5')
+    add_pitch_trace(fig, fouls_home, 'Fouls (Home)', '#f5a442')
+    add_pitch_trace(fig, in_play_home, 'In Play (Home)', '#42f54e')
 
-        add_pitch_trace(fig, balls, 'Balls', '#4287f5')
-        add_pitch_trace(fig, called_strikes, 'Called Strikes', '#f54242')
-        add_pitch_trace(fig, swinging_strikes, 'Swinging Strikes', '#9c42f5')
-        add_pitch_trace(fig, fouls, 'Fouls', '#f5a442')
-        add_pitch_trace(fig, in_play, 'In Play', '#42f54e')
+    # Add away pitches
+    pitch_data_away = [(float(p[0]), float(p[1]), p[2], p[3], p[4], p[5]) for p in away_pitches]
+    balls_away = [p for p in pitch_data_away if p[3] == 'Ball']
+    called_strikes_away = [p for p in pitch_data_away if p[3] == 'Called Strike']
+    swinging_strikes_away = [p for p in pitch_data_away if p[3] == 'Swinging Strike']
+    fouls_away = [p for p in pitch_data_away if p[3] == 'Foul']
+    in_play_away = [p for p in pitch_data_away if p[3].startswith('In play')]
 
-        add_strike_zone(fig, pitch_data)
-        add_umpire_strike_zone(fig, called_strikes, balls)
-        if pitch_data:
-            add_last_pitch(fig, pitch_data)
+    add_pitch_trace(fig, balls_away, 'Balls (Away)', '#4287f5', visible=False)
+    add_pitch_trace(fig, called_strikes_away, 'Called Strikes (Away)', '#f54242', visible=False)
+    add_pitch_trace(fig, swinging_strikes_away, 'Swinging Strikes (Away)', '#9c42f5', visible=False)
+    add_pitch_trace(fig, fouls_away, 'Fouls (Away)', '#f5a442', visible=False)
+    add_pitch_trace(fig, in_play_away, 'In Play (Away)', '#42f54e', visible=False)
 
-        fig.update_xaxes(range=[-3, 3], title="Horizontal Location (feet)", row=1, col=idx, gridcolor='#444444')
-        fig.update_yaxes(range=[0, 6], title="Vertical Location (feet)", row=1, col=idx, gridcolor='#444444')
+    add_strike_zone(fig, pitch_data_home + pitch_data_away)
+    add_umpire_strike_zone(fig, called_strikes_home + called_strikes_away, balls_home + balls_away)
+
+    if pitch_data_home:
+        add_last_pitch(fig, pitch_data_home)
+    elif pitch_data_away:
+        add_last_pitch(fig, pitch_data_away)
+
+    fig.update_xaxes(range=[-3, 3], title="Horizontal Location (feet)", gridcolor='#444444')
+    fig.update_yaxes(range=[0, 6], title="Vertical Location (feet)", gridcolor='#444444')
 
     fig.update_layout(
         title=f"{game_title}<br><sub>{subtitle}</sub>",
@@ -218,7 +249,8 @@ def generate_plot_for_game(home_pitches, away_pitches, game_title, subtitle):
         paper_bgcolor='#2b2b2b',
         font=dict(color='#e0e0e0'),
         margin=dict(l=50, r=50, t=80, b=50),
-        height=600
+        height=600,
+        width=600  # Ensure the plot is square
     )
 
     logging.debug("Plot generated successfully")
@@ -276,33 +308,38 @@ def create_app():
 
     @app.route('/api/games')
     def get_games():
-        date = datetime.now().strftime("%m/%d/%Y")
+        date = datetime.now(local_tz).strftime("%m/%d/%Y")
         games = get_game_statuses(date)
         return jsonify(games)
 
     @app.route('/api/game/<int:game_id>')
-    def get_game_data(game_id):
-        result = get_play_data(game_id)
-        if result is None:
-            return jsonify({"error": "Error retrieving game data"}), 404
+    def get_game_data_route(game_id):
+        try:
+            result = get_play_data(game_id)
+            if result is None:
+                logging.error("No data returned from get_play_data")
+                return jsonify({"error": "Error retrieving game data"}), 404
 
-        home_pitches, away_pitches, home_team, away_team, home_pitcher, away_pitcher, umpire = result
-        game_title = f"{away_team} @ {home_team}"
-        subtitle = f"Home Pitcher: {home_pitcher} ({len(home_pitches)} pitches), Away Pitcher: {away_pitcher} ({len(away_pitches)} pitches), Umpire: {umpire}"
+            home_pitches, away_pitches, home_team, away_team, home_pitcher, away_pitcher, umpire = result
+            game_title = f"{away_team} @ {home_team}"
+            subtitle = f"Home Pitcher: {home_pitcher} ({len(home_pitches)} pitches), Away Pitcher: {away_pitcher} ({len(away_pitches)} pitches), Umpire: {umpire}"
 
-        pitch_plot = generate_plot_for_game(home_pitches, away_pitches, game_title, subtitle)
-        stats_plot = generate_pitch_stats_plot(home_pitches, away_pitches)
+            pitch_plot = generate_plot_for_game(home_pitches, away_pitches, game_title, subtitle)
+            stats_plot = generate_pitch_stats_plot(home_pitches, away_pitches)
 
-        return jsonify({
-            "pitch_plot": pitch_plot.to_json(),
-            "stats_plot": stats_plot.to_json(),
-            "game_info": {
-                "title": game_title,
-                "subtitle": subtitle,
-                "home_pitches": len(home_pitches),
-                "away_pitches": len(away_pitches)
-            }
-        })
+            return jsonify({
+                "pitch_plot": pitch_plot.to_json(),
+                "stats_plot": stats_plot.to_json(),
+                "game_info": {
+                    "title": game_title,
+                    "subtitle": subtitle,
+                    "home_pitches": len(home_pitches),
+                    "away_pitches": len(away_pitches)
+                }
+            })
+        except Exception as e:
+            logging.exception("An error occurred while fetching game data")
+            return jsonify({"error": "Internal Server Error"}), 500
 
     return app
 
